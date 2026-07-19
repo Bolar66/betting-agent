@@ -4,6 +4,10 @@ Automaattinen agentti joka analysoi tulosveto- ja maalintekijä-kertoimia
 ja ehdottaa päivittäin yhden lapun (kombinaatiovedon), jonka ihminen lyö 
 manuaalisesti pienellä panoksella.
 
+## tekijät
+
+Ruge&Smolge
+
 ## Ympäristön pystytys
 
 1. Cloonaa repo
