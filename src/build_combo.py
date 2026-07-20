@@ -20,6 +20,15 @@ TURSO_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 
+def is_correct_run_time():
+    """Tarkistaa onko juuri nyt klo 12 Suomen aikaa. GitHub Actions
+    laukaisee workflown kahdesti (klo 9 ja 10 UTC) DST:n takia -
+    tämä varmistaa että botti toimii vain oikeaan aikaan eikä lähetä
+    viestiä kahteen kertaan."""
+    now_fi = datetime.now(FINLAND_TZ)
+    return now_fi.hour == 12
+
+
 def get_connection():
     """Avaa yhteyden Turso-tietokantaan."""
     return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
@@ -184,6 +193,10 @@ def send_telegram_message(text):
 
 
 if __name__ == "__main__":
+    if not is_correct_run_time():
+        print("Ei oikea ajoaika Suomen aikaa - ohitetaan tämä ajo.")
+        exit(0)
+
     rows = get_latest_odds()
     selections_by_game = build_h2h_selections(rows)
     selections_by_game = add_mock_player_props(selections_by_game)  # TODO: korvaa oikealla haulla
