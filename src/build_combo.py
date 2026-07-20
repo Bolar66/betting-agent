@@ -1,7 +1,12 @@
+import os
 import sqlite3
+import requests
 from math import prod
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DB_PATH = "data/odds.db"
 
@@ -10,8 +15,8 @@ MAX_ODDS = 250_000
 TARGET_MIN_ODDS = 10_000
 
 FINLAND_TZ = ZoneInfo("Europe/Helsinki")
-NIGHT_START_HOUR = 18  # klo 18 Suomen aikaa
-NIGHT_END_HOUR = 6     # klo 06 Suomen aikaa (seuraavana aamuna)
+NIGHT_START_HOUR = 18
+NIGHT_END_HOUR = 6
 
 
 def get_latest_odds():
@@ -81,10 +86,7 @@ def add_mock_player_props(selections_by_game):
 
 def build_bet_builder_legs(selections_by_game):
     """Yhdistää jokaisen ottelun kaikki valinnat yhdeksi 'bet builder'
-    -legiksi: yhteiskerroin = valintojen kertoimien tulo.
-    HUOM: olettaa valinnat tilastollisesti riippumattomiksi, mikä
-    todennäköisesti aliarvioi todellista osumatodennäköisyyttä
-    (esim. joukkueen voitto ja oman pelaajan maalinteko korreloivat)."""
+    -legiksi: yhteiskerroin = valintojen kertoimien tulo."""
     legs = []
     for game_id, g in selections_by_game.items():
         combined_price = prod(sel["price"] for sel in g["selections"])
@@ -108,10 +110,8 @@ def get_next_night_window(now_utc):
     today_night_start = now_fi.replace(hour=NIGHT_START_HOUR, minute=0, second=0, microsecond=0)
 
     if now_fi.hour < NIGHT_END_HOUR:
-        # Ollaan jo yön puolella (esim. klo 03:00) -> yö alkoi eilen klo 18
         night_start = today_night_start - timedelta(days=1)
     else:
-        # Joko yö on jo käynnissä (klo >= 18) tai ei vielä alkanut tänään
         night_start = today_night_start
 
     night_end = (night_start + timedelta(days=1)).replace(
@@ -120,11 +120,11 @@ def get_next_night_window(now_utc):
 
     return night_start.astimezone(timezone.utc), night_end.astimezone(timezone.utc)
 
-
-def filter_to_next_night(legs):
+def filter_to_next_night(legs, now_utc=None):
     """Rajaa legit lähimpään tulevaan/käynnissä olevaan NHL-yöhön
     (klo 18-06 Suomen aikaa)."""
-    now_utc = datetime.now(timezone.utc)
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
     window_start, window_end = get_next_night_window(now_utc)
 
     in_window = []
@@ -135,14 +135,9 @@ def filter_to_next_night(legs):
 
     return in_window, window_start, window_end
 
-
 def build_slip(legs):
-    """Rakentaa lapun annetuista legeistä:
-    - Käyttää enintään MAX_LEGS legiä
-    - Ei koskaan ylitä MAX_ODDS:ia (250k)
-    - Pyrkii saavuttamaan TARGET_MIN_ODDS:in (10k) jos mahdollista
-    - Hiljaisina öinä palauttaa silti parhaan mahdollisen lapun
-      sen sijaan että palauttaisi tyhjää."""
+    """Rakentaa lapun annetuista legeistä. Ei koskaan ylitä 250k,
+    pyrkii 10k+, palauttaa parhaan mahdollisen myös hiljaisina öinä."""
     sorted_legs = sorted(legs, key=lambda x: -x["implied_prob"])
 
     selected = []
@@ -173,29 +168,38 @@ def build_slip(legs):
     }
 
 
+def send_telegram_message(text):
+    """Lähettää viestin Telegram-bottiin."""
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    response = requests.post(url, data={"chat_id": chat_id, "text": text})
+    response.raise_for_status()
+
+
 if __name__ == "__main__":
     rows = get_latest_odds()
     selections_by_game = build_h2h_selections(rows)
     selections_by_game = add_mock_player_props(selections_by_game)  # TODO: korvaa oikealla haulla
 
     legs = build_bet_builder_legs(selections_by_game)
-    print(f"Muodostettu {len(legs)} bet builder -legiä (per ottelu).")
-
-    legs, window_start, window_end = filter_to_next_night(legs)
-    window_start_fi = window_start.astimezone(FINLAND_TZ)
-    window_end_fi = window_end.astimezone(FINLAND_TZ)
-    print(f"Yö-ikkuna (Suomen aikaa): {window_start_fi.strftime('%d.%m.%Y %H:%M')} - {window_end_fi.strftime('%d.%m.%Y %H:%M')}")
-    print(f"Näistä {len(legs)} legiä osuu tähän ikkunaan.\n")
+    legs, window_start, window_end = filter_to_next_night(
+        legs, now_utc=datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+    )    
 
     result = build_slip(legs)
+
     if result is None:
-        print("Ei yhtään ottelua/legiä saatavilla tälle yölle.")
+        message = "Ei löytynyt yhtään ottelua tälle yölle."
     else:
-        status = "TAVOITE SAAVUTETTU (10k-250k)" if result["reached_target"] else "HILJAINEN YÖ - alle tavoitteen"
-        print(f"[{status}]")
-        print(f"Lappu ({len(result['legs'])} ottelua):")
+        status = "Tavoite saavutettu" if result["reached_target"] else "Hiljainen yö"
+        lines = [f"{status} - {len(result['legs'])} kohdetta", ""]
         for leg in result["legs"]:
-            print(f"  {leg['match']}")
-            print(f"    -> {leg['pick']} @ {leg['price']:.2f}")
-        print(f"\nYhteiskerroin: {result['total_odds']:.1f}")
-        print(f"Arvioitu osumatodennäköisyys (bookmakerin implisiittinen): {result['total_prob']*100:.6f}%")
+            lines.append(f"- {leg['match']}")
+            lines.append(f"  {leg['pick']} @ {leg['price']:.2f}")
+        lines.append("")
+        lines.append(f"Yhteiskerroin: {result['total_odds']:.1f}")
+        message = "\n".join(lines)
+
+    print(message)
+    send_telegram_message(message)
