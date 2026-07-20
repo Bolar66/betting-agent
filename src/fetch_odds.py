@@ -1,15 +1,21 @@
 import os
-import sqlite3
-from datetime import datetime, timezone
-
+import libsql
 import requests
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
 API_KEY = os.getenv("ODDS_API_KEY")
 BASE_URL = "https://api.the-odds-api.com/v4"
-DB_PATH = "data/odds.db"
+
+TURSO_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+
+
+def get_connection():
+    """Avaa yhteyden Turso-tietokantaan."""
+    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
 
 
 def get_nhl_odds():
@@ -27,10 +33,9 @@ def get_nhl_odds():
 
 
 def init_db():
-    """Luo tietokannan ja taulun jos niitä ei vielä ole."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
+    """Luo taulun jos sitä ei vielä ole."""
+    conn = get_connection()
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS odds_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             game_id TEXT NOT NULL,
@@ -45,15 +50,11 @@ def init_db():
         )
     """)
     conn.commit()
-    conn.close()
+    return conn
 
 
-def save_odds(games):
-    """Tallentaa haetun datan tietokantaan. Jokainen ajo lisää uuden
-    'snapshotin' (rivit fetched_at-aikaleimalla), eli historia säilyy
-    eikä vanhaa dataa ylikirjoiteta."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+def save_odds(conn, games):
+    """Tallentaa haetun datan tietokantaan uutena snapshottina."""
     fetched_at = datetime.now(timezone.utc).isoformat()
 
     rows_inserted = 0
@@ -61,7 +62,7 @@ def save_odds(games):
         for bookmaker in game.get("bookmakers", []):
             for market in bookmaker.get("markets", []):
                 for outcome in market.get("outcomes", []):
-                    cursor.execute("""
+                    conn.execute("""
                         INSERT INTO odds_snapshots (
                             game_id, sport_key, home_team, away_team,
                             commence_time, bookmaker, outcome_name,
@@ -81,14 +82,13 @@ def save_odds(games):
                     rows_inserted += 1
 
     conn.commit()
-    conn.close()
     return rows_inserted
 
 
 if __name__ == "__main__":
-    init_db()
+    conn = init_db()
     games = get_nhl_odds()
     print(f"Löytyi {len(games)} tulevaa ottelua.")
 
-    rows = save_odds(games)
-    print(f"Tallennettu {rows} riviä tietokantaan ({DB_PATH}).")
+    rows = save_odds(conn, games)
+    print(f"Tallennettu {rows} riviä Turso-tietokantaan.")

@@ -2,9 +2,6 @@ name: Daily NHL Bet Slip
 
 on:
   schedule:
-    # klo 12:00 Suomen kesäaikaa (UTC+3) = klo 09:00 UTC
-    # klo 12:00 Suomen talviaikaa (UTC+2) = klo 10:00 UTC
-    # Käytetään 09:00 UTC, tarkistetaan/säädetään talviaikaan siirryttäessä
     - cron: '0 9 * * *'
   workflow_dispatch:
 
@@ -18,7 +15,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.13'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -26,19 +23,14 @@ jobs:
       - name: Fetch odds
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: python src/fetch_odds.py
 
       - name: Build and send slip
         env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python src/build_combo.py
-
-      - name: Commit updated database
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/odds.db
-          git commit -m "Update odds data [automated]" || echo "Ei muutoksia"
-          git push

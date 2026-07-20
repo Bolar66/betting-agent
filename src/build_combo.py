@@ -1,5 +1,5 @@
 import os
-import sqlite3
+import libsql
 import requests
 from math import prod
 from datetime import datetime, timezone, timedelta
@@ -7,8 +7,6 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
-
-DB_PATH = "data/odds.db"
 
 MAX_LEGS = 20
 MAX_ODDS = 250_000
@@ -18,12 +16,19 @@ FINLAND_TZ = ZoneInfo("Europe/Helsinki")
 NIGHT_START_HOUR = 18
 NIGHT_END_HOUR = 6
 
+TURSO_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+
+
+def get_connection():
+    """Avaa yhteyden Turso-tietokantaan."""
+    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+
 
 def get_latest_odds():
     """Hakee jokaiselle ottelulle vain uusimman snapshotin."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
+    conn = get_connection()
+    cursor = conn.execute("""
         WITH latest AS (
             SELECT game_id, MAX(fetched_at) AS max_fetched
             FROM odds_snapshots
@@ -36,7 +41,6 @@ def get_latest_odds():
         GROUP BY o.game_id, o.outcome_name
     """)
     rows = cursor.fetchall()
-    conn.close()
     return rows
 
 
@@ -120,6 +124,7 @@ def get_next_night_window(now_utc):
 
     return night_start.astimezone(timezone.utc), night_end.astimezone(timezone.utc)
 
+
 def filter_to_next_night(legs, now_utc=None):
     """Rajaa legit lähimpään tulevaan/käynnissä olevaan NHL-yöhön
     (klo 18-06 Suomen aikaa)."""
@@ -134,6 +139,7 @@ def filter_to_next_night(legs, now_utc=None):
             in_window.append(leg)
 
     return in_window, window_start, window_end
+
 
 def build_slip(legs):
     """Rakentaa lapun annetuista legeistä. Ei koskaan ylitä 250k,
@@ -183,9 +189,7 @@ if __name__ == "__main__":
     selections_by_game = add_mock_player_props(selections_by_game)  # TODO: korvaa oikealla haulla
 
     legs = build_bet_builder_legs(selections_by_game)
-    legs, window_start, window_end = filter_to_next_night(
-        legs, now_utc=datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
-    )    
+    legs, window_start, window_end = filter_to_next_night(legs)
 
     result = build_slip(legs)
 
