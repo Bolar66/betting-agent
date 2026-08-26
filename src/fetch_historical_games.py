@@ -1,7 +1,7 @@
 import requests
 import time
 
-SEASONS = ["20222023", "20232024", "20242025"]  # 3 viime kautta
+SEASONS = ["20202021", "20212022", "20222023", "20232024", "20242025"]  # 5 viime kautta
 
 
 def get_all_team_abbrevs():
