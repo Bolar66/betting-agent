@@ -11,15 +11,14 @@ from win_model import (
     get_current_team_ratings,
     predict_win_probability,
     calculate_edge,
-    build_h2h_rationale,
 )
 
 load_dotenv()
 
-MIN_EDGE = 0.05  # vähintään 5 prosenttiyksikön edge ennen kuin mallin valinta korvaa bookmakerin suosikin
 MAX_LEGS = 20
 MAX_ODDS = 250_000
 TARGET_MIN_ODDS = 10_000
+MIN_EDGE = 0.05
 
 FINLAND_TZ = ZoneInfo("Europe/Helsinki")
 NIGHT_START_HOUR = 18
@@ -27,6 +26,12 @@ NIGHT_END_HOUR = 6
 
 TURSO_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+
+SLIP_TIERS = {
+    "chilli": {"emoji": "🧊", "min_odds": 50, "max_odds": 1_000, "min_legs": 2, "max_legs": 6},
+    "perus":  {"emoji": "⚖️", "min_odds": 10_000, "max_odds": 100_000, "min_legs": 6, "max_legs": 15},
+    "testo":  {"emoji": "🔥", "min_odds": 75_000, "max_odds": 250_000, "min_legs": 12, "max_legs": 20},
+}
 
 
 def is_correct_run_time():
@@ -56,12 +61,9 @@ def get_latest_odds():
 
 
 def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model):
-    """Muodostaa h2h-valinnan per ottelu, käyttäen omaa kalibroitua
-    mallia PÄÄTÖKSENTEKOON. Vaatii vähintään MIN_EDGE-suuruisen edgen
-    ennen kuin malli korvaa bookmakerin oman suosikin - pienemmällä
-    erolla käytetään turvallisempaa bookmaker-suosikkia, koska pieni
-    edge voi johtua kalibroinnin epätarkkuudesta, ei todellisesta
-    virhehinnoittelusta."""
+    """Muodostaa h2h-valinnan per ottelu käyttäen kalibroitua mallia.
+    Vaatii vähintään MIN_EDGE-suuruisen edgen ennen kuin malli
+    korvaa bookmakerin oman suosikin."""
     games = {}
     for game_id, home, away, commence, outcome_name, price in rows:
         games.setdefault(game_id, {
@@ -79,8 +81,7 @@ def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model
                 "match": f"{home} vs {away}",
                 "commence": g["commence"],
                 "selections": [
-                    {"description": f"{best_outcome} voittaa (fallback - ei omaa mallia)",
-                     "market_type": "h2h", "price": best_price}
+                    {"description": f"{best_outcome} voittaa", "market_type": "h2h", "price": best_price}
                 ],
             }
             continue
@@ -100,38 +101,26 @@ def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model
         best_edge = max(home_edge, away_edge)
 
         if best_edge >= MIN_EDGE:
-            # Riittävän suuri edge löytyi - luotetaan malliin
             if home_edge >= away_edge:
-                pick, price, prob = home, home_price, calibrated_prob
+                pick, price = home, home_price
             else:
-                pick, price, prob = away, away_price, 1 - calibrated_prob
-            rationale = build_h2h_rationale(pick, prob, price, lam_home, lam_away)
-            description = f"{pick} voittaa"
+                pick, price = away, away_price
         else:
-            # Ei riittävää edgeä - käytetään turvallisempaa bookmaker-suosikkia
-            pick, price = min(
-                [(home, home_price), (away, away_price)], key=lambda x: x[1]
-            )
-            prob = calibrated_prob if pick == home else (1 - calibrated_prob)
-            rationale = (
-                f"{pick} (bookmaker-suosikki, ei riittävää edgeä mallin mukaan: "
-                f"{best_edge*100:+.0f}pp < {MIN_EDGE*100:.0f}pp kynnys)"
-            )
-            description = f"{pick} voittaa"
+            pick, price = min([(home, home_price), (away, away_price)], key=lambda x: x[1])
 
         selections_by_game[game_id] = {
             "match": f"{home} vs {away}",
             "commence": g["commence"],
             "selections": [
-                {"description": description, "market_type": "h2h",
-                 "price": price, "rationale": rationale}
+                {"description": f"{pick} voittaa", "market_type": "h2h", "price": price}
             ],
         }
 
     return selections_by_game
 
+
 def add_mock_player_props(selections_by_game):
-    """MOCK-DATA: korvataan myöhemmin oikealla haulla kauden alkaessa."""
+    """MOCK-DATA: korvataan oikealla haulla kun kausi alkaa."""
     mock_props = {
         "9de33ce1013f2a3375dbded2c9fbc7d6": [
             {"description": "Sebastian Aho tekee maalin", "market_type": "player_goal_scorer_anytime", "price": 2.20},
@@ -154,8 +143,6 @@ def build_bet_builder_legs(selections_by_game):
     for game_id, g in selections_by_game.items():
         combined_price = prod(sel["price"] for sel in g["selections"])
         description = " + ".join(sel["description"] for sel in g["selections"])
-        rationales = [sel["rationale"] for sel in g["selections"] if "rationale" in sel]
-
         legs.append({
             "game_id": game_id,
             "match": g["match"],
@@ -163,7 +150,6 @@ def build_bet_builder_legs(selections_by_game):
             "pick": description,
             "price": combined_price,
             "implied_prob": 1 / combined_price,
-            "rationale": " | ".join(rationales) if rationales else None,
         })
     return legs
 
@@ -196,41 +182,99 @@ def filter_to_next_night(legs, now_utc=None):
     return in_window, window_start, window_end
 
 
-def build_slip(legs):
+def build_slip_tiered(legs, min_odds, max_odds, min_legs=1, max_legs=20):
+    """Rakentaa lapun annetulla kerroin-haarukalla ja legimäärillä."""
     sorted_legs = sorted(legs, key=lambda x: -x["implied_prob"])
     selected = []
     total_odds = 1.0
 
     for leg in sorted_legs:
-        if len(selected) >= MAX_LEGS:
+        if len(selected) >= max_legs:
             break
         candidate_odds = total_odds * leg["price"]
-        if candidate_odds > MAX_ODDS:
+        if candidate_odds > max_odds:
             continue
         selected.append(leg)
         total_odds = candidate_odds
-        if total_odds >= TARGET_MIN_ODDS:
+        if total_odds >= min_odds and len(selected) >= min_legs:
             break
 
     if not selected:
         return None
 
     total_prob = prod(leg["implied_prob"] for leg in selected)
-    reached_target = total_odds >= TARGET_MIN_ODDS
-
     return {
         "legs": selected,
         "total_odds": total_odds,
         "total_prob": total_prob,
-        "reached_target": reached_target,
+        "reached_target": total_odds >= min_odds,
     }
+
+
+def format_date_range(legs):
+    """Muodostaa päivämääräalueen tekstin legien commence_time-kentistä."""
+    dates = sorted({
+        datetime.fromisoformat(leg["commence"].replace("Z", "+00:00"))
+        .astimezone(FINLAND_TZ).date()
+        for leg in legs
+    })
+
+    if not dates:
+        return ""
+
+    first, last = dates[0], dates[-1]
+    if first == last:
+        return first.strftime("%d.%m.%Y")
+    else:
+        return f"{first.strftime('%d.%m')}-{last.strftime('%d.%m.%Y')}"
+
+
+def escape_markdown(text):
+    """Escapee MarkdownV2:n erikoismerkit tavallisesta tekstistä."""
+    special_chars = r"_*[]()~`>#+-=|{}.!"
+    for char in special_chars:
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
+def format_slip_markdown(tier_key, tier_config, result):
+    """Muotoilee yhden lapun Telegramin MarkdownV2-tyyliin,
+    kohteet numeroituina, kerroin alleviivattuna."""
+    emoji = tier_config["emoji"]
+    name = tier_key.upper()
+
+    if result is None:
+        return f"{emoji} *{name}*\n_Ei löytynyt sopivaa lappua tälle riskitasolle\\._"
+
+    status_emoji = "✅" if result["reached_target"] else "⚠️"
+    total_odds_str = escape_markdown(f"{result['total_odds']:.1f}")
+    lines = [
+        f"{emoji} *{name}* {status_emoji}",
+        f"*{len(result['legs'])} kohdetta* — yhteiskerroin __*{total_odds_str}*__",
+        "",
+    ]
+
+    for i, leg in enumerate(result["legs"], start=1):
+        match = escape_markdown(leg["match"])
+        pick = escape_markdown(leg["pick"])
+        price = escape_markdown(f"{leg['price']:.2f}")
+
+        lines.append(f"*{i}\\.* {match}")
+        lines.append(f"    → {pick} @ __{price}__")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def send_telegram_message(text):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    response = requests.post(url, data={"chat_id": chat_id, "text": text})
+    response = requests.post(url, data={
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "MarkdownV2",
+    })
     response.raise_for_status()
 
 
@@ -250,22 +294,24 @@ if __name__ == "__main__":
     legs = build_bet_builder_legs(selections_by_game)
     legs, window_start, window_end = filter_to_next_night(legs)
 
+    print(f"Löytyi {len(legs)} legiä tälle yölle.\n")
 
-    result = build_slip(legs)
+    date_range = escape_markdown(format_date_range(legs))
+    message_parts = [f"🏒 *NHL LAPUT — {date_range}* 🏒", ""]
 
-    if result is None:
-        message = "Ei löytynyt yhtään ottelua tälle yölle."
-    else:
-        status = "Tavoite saavutettu" if result["reached_target"] else "Hiljainen yö"
-        lines = [f"{status} - {len(result['legs'])} kohdetta", ""]
-        for leg in result["legs"]:
-            lines.append(f"- {leg['match']}")
-            lines.append(f"  {leg['pick']} @ {leg['price']:.2f}")
-            if leg["rationale"]:
-                lines.append(f"  ({leg['rationale']})")
-        lines.append("")
-        lines.append(f"Yhteiskerroin: {result['total_odds']:.1f}")
-        message = "\n".join(lines)
+    for tier_key, tier_config in SLIP_TIERS.items():
+        result = build_slip_tiered(
+            legs, tier_config["min_odds"], tier_config["max_odds"],
+            tier_config["min_legs"], tier_config["max_legs"]
+        )
+        message_parts.append(format_slip_markdown(tier_key, tier_config, result))
+        message_parts.append("")
 
-    print(message)
+        print(f"--- {tier_key.upper()} ---")
+        if result:
+            print(f"{len(result['legs'])} kohdetta, kerroin {result['total_odds']:.1f}")
+        else:
+            print("Ei löytynyt sopivaa lappua.")
+
+    message = "\n".join(message_parts)
     send_telegram_message(message)
