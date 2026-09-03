@@ -34,13 +34,44 @@ SLIP_TIERS = {
 }
 
 
-def is_correct_run_time():
-    now_fi = datetime.now(FINLAND_TZ)
-    return now_fi.hour == 12
-
-
 def get_connection():
     return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+
+
+def init_bot_state_table():
+    """Luo taulun joka pitää kirjaa siitä milloin viesti on viimeksi
+    lähetetty - tämän avulla varmistetaan täsmälleen yksi viesti
+    päivässä, riippumatta siitä mihin kellonaikaan GitHub Actionsin
+    cron-ajo sattuu laukeamaan (ajastus ei ole aina tarkka)."""
+    conn = get_connection()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def already_sent_today():
+    """Tarkistaa onko viesti jo lähetetty tänään (Suomen aikaa)."""
+    conn = init_bot_state_table()
+    cursor = conn.execute("SELECT value FROM bot_state WHERE key = 'last_sent_date'")
+    row = cursor.fetchone()
+    today = datetime.now(FINLAND_TZ).date().isoformat()
+    return row is not None and row[0] == today
+
+
+def mark_sent_today():
+    """Merkitsee tämän päivän viestin lähetetyksi."""
+    conn = init_bot_state_table()
+    today = datetime.now(FINLAND_TZ).date().isoformat()
+    conn.execute("""
+        INSERT INTO bot_state (key, value) VALUES ('last_sent_date', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, (today,))
+    conn.commit()
 
 
 def get_latest_odds():
@@ -279,8 +310,8 @@ def send_telegram_message(text):
 
 
 if __name__ == "__main__":
-    if not is_correct_run_time():
-        print("Ei oikea ajoaika Suomen aikaa - ohitetaan tämä ajo.")
+    if already_sent_today():
+        print("Viesti jo lähetetty tänään - ohitetaan tämä ajo.")
         exit(0)
 
     print("Koulutetaan kalibrointimalli...")
@@ -315,3 +346,4 @@ if __name__ == "__main__":
 
     message = "\n".join(message_parts)
     send_telegram_message(message)
+    mark_sent_today()
