@@ -2,8 +2,13 @@ name: Daily NHL Bet Slip
 
 on:
   schedule:
-    - cron: '0 9 * * *'   # klo 12:00 Suomen kesäaikaa (UTC+3)
-    - cron: '0 10 * * *'  # klo 12:00 Suomen talviaikaa (UTC+2)
+    - cron: '0 8 * * *'
+    - cron: '30 8 * * *'
+    - cron: '0 9 * * *'
+    - cron: '30 9 * * *'
+    - cron: '0 10 * * *'
+    - cron: '30 10 * * *'
+    - cron: '0 11 * * *'
   workflow_dispatch:
 
 jobs:
