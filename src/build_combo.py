@@ -12,6 +12,7 @@ from win_model import (
     predict_win_probability,
     calculate_edge,
 )
+from check_results import check_and_update_results, get_results_summary
 
 load_dotenv()
 
@@ -39,10 +40,6 @@ def get_connection():
 
 
 def init_bot_state_table():
-    """Luo taulun joka pitää kirjaa siitä milloin viesti on viimeksi
-    lähetetty - tämän avulla varmistetaan täsmälleen yksi viesti
-    päivässä, riippumatta siitä mihin kellonaikaan GitHub Actionsin
-    cron-ajo sattuu laukeamaan (ajastus ei ole aina tarkka)."""
     conn = get_connection()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_state (
@@ -55,7 +52,6 @@ def init_bot_state_table():
 
 
 def already_sent_today():
-    """Tarkistaa onko viesti jo lähetetty tänään (Suomen aikaa)."""
     conn = init_bot_state_table()
     cursor = conn.execute("SELECT value FROM bot_state WHERE key = 'last_sent_date'")
     row = cursor.fetchone()
@@ -64,13 +60,44 @@ def already_sent_today():
 
 
 def mark_sent_today():
-    """Merkitsee tämän päivän viestin lähetetyksi."""
     conn = init_bot_state_table()
     today = datetime.now(FINLAND_TZ).date().isoformat()
     conn.execute("""
         INSERT INTO bot_state (key, value) VALUES ('last_sent_date', ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
     """, (today,))
+    conn.commit()
+
+
+def init_sent_picks_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent_picks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sent_date TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            game_id TEXT NOT NULL,
+            home_team TEXT NOT NULL,
+            away_team TEXT NOT NULL,
+            commence_time TEXT NOT NULL,
+            pick_description TEXT NOT NULL,
+            price REAL NOT NULL,
+            checked INTEGER DEFAULT 0,
+            hit INTEGER DEFAULT NULL
+        )
+    """)
+    conn.commit()
+
+
+def save_sent_picks(conn, tier_key, result, sent_date):
+    if result is None:
+        return
+    for leg in result["legs"]:
+        home, away = leg["match"].split(" vs ")
+        conn.execute("""
+            INSERT INTO sent_picks
+            (sent_date, tier, game_id, home_team, away_team, commence_time, pick_description, price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (sent_date, tier_key, leg["game_id"], home, away, leg["commence"], leg["pick"], leg["price"]))
     conn.commit()
 
 
@@ -92,9 +119,6 @@ def get_latest_odds():
 
 
 def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model):
-    """Muodostaa h2h-valinnan per ottelu käyttäen kalibroitua mallia.
-    Vaatii vähintään MIN_EDGE-suuruisen edgen ennen kuin malli
-    korvaa bookmakerin oman suosikin."""
     games = {}
     for game_id, home, away, commence, outcome_name, price in rows:
         games.setdefault(game_id, {
@@ -151,7 +175,6 @@ def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model
 
 
 def add_mock_player_props(selections_by_game):
-    """MOCK-DATA: korvataan oikealla haulla kun kausi alkaa."""
     mock_props = {
         "9de33ce1013f2a3375dbded2c9fbc7d6": [
             {"description": "Sebastian Aho tekee maalin", "market_type": "player_goal_scorer_anytime", "price": 2.20},
@@ -214,7 +237,6 @@ def filter_to_next_night(legs, now_utc=None):
 
 
 def build_slip_tiered(legs, min_odds, max_odds, min_legs=1, max_legs=20):
-    """Rakentaa lapun annetulla kerroin-haarukalla ja legimäärillä."""
     sorted_legs = sorted(legs, key=lambda x: -x["implied_prob"])
     selected = []
     total_odds = 1.0
@@ -243,16 +265,13 @@ def build_slip_tiered(legs, min_odds, max_odds, min_legs=1, max_legs=20):
 
 
 def format_date_range(legs):
-    """Muodostaa päivämääräalueen tekstin legien commence_time-kentistä."""
     dates = sorted({
         datetime.fromisoformat(leg["commence"].replace("Z", "+00:00"))
         .astimezone(FINLAND_TZ).date()
         for leg in legs
     })
-
     if not dates:
         return ""
-
     first, last = dates[0], dates[-1]
     if first == last:
         return first.strftime("%d.%m.%Y")
@@ -261,7 +280,6 @@ def format_date_range(legs):
 
 
 def escape_markdown(text):
-    """Escapee MarkdownV2:n erikoismerkit tavallisesta tekstistä."""
     special_chars = r"_*[]()~`>#+-=|{}.!"
     for char in special_chars:
         text = text.replace(char, f"\\{char}")
@@ -269,8 +287,6 @@ def escape_markdown(text):
 
 
 def format_slip_markdown(tier_key, tier_config, result):
-    """Muotoilee yhden lapun Telegramin MarkdownV2-tyyliin,
-    kohteet numeroituina, kerroin alleviivattuna."""
     emoji = tier_config["emoji"]
     name = tier_key.upper()
 
@@ -297,6 +313,18 @@ def format_slip_markdown(tier_key, tier_config, result):
     return "\n".join(lines)
 
 
+def format_results_report(results_summary):
+    if not results_summary:
+        return None
+    lines = ["📊 *Edellisyön tulokset*", ""]
+    for tier, hits, total in results_summary:
+        hits = hits or 0
+        line = escape_markdown(f"{tier.upper()}: {hits}/{total} osui")
+        lines.append(line)
+    lines.append("")
+    return "\n".join(lines)
+
+
 def send_telegram_message(text):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -308,11 +336,21 @@ def send_telegram_message(text):
     })
     response.raise_for_status()
 
-
 if __name__ == "__main__":
     if already_sent_today():
         print("Viesti jo lähetetty tänään - ohitetaan tämä ajo.")
         exit(0)
+
+    # Varmistetaan että sent_picks-taulu on olemassa ennen kuin
+    # yritetään lukea/kirjoittaa siihen
+    init_sent_picks_table(get_connection())
+
+    # Tarkistetaan edellisyön tulokset ennen uuden lapun rakentamista
+    print("Tarkistetaan edellisyön tulokset...")
+    check_and_update_results()
+
+    results_summary = get_results_summary()
+    results_text = format_results_report(results_summary)
 
     print("Koulutetaan kalibrointimalli...")
     calibration_model = train_calibration_model()
@@ -328,7 +366,16 @@ if __name__ == "__main__":
     print(f"Löytyi {len(legs)} legiä tälle yölle.\n")
 
     date_range = escape_markdown(format_date_range(legs))
-    message_parts = [f"🏒 *NHL LAPUT — {date_range}* 🏒", ""]
+
+    message_parts = []
+    if results_text:
+        message_parts.append(results_text)
+    message_parts.append(f"🏒 *NHL LAPUT — {date_range}* 🏒")
+    message_parts.append("")
+
+    conn = get_connection()
+    init_sent_picks_table(conn)
+    today = datetime.now(FINLAND_TZ).date().isoformat()
 
     for tier_key, tier_config in SLIP_TIERS.items():
         result = build_slip_tiered(
@@ -337,6 +384,8 @@ if __name__ == "__main__":
         )
         message_parts.append(format_slip_markdown(tier_key, tier_config, result))
         message_parts.append("")
+
+        save_sent_picks(conn, tier_key, result, today)
 
         print(f"--- {tier_key.upper()} ---")
         if result:

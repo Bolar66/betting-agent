@@ -1,0 +1,22 @@
+name: Biweekly Recalibration Report
+
+on:
+  schedule:
+    - cron: '0 9 * * 0'  # joka sunnuntai klo 12 Suomen kesäaikaa — skripti itse päättää onko oikea 2 viikon väli
+  workflow_dispatch:
+
+jobs:
+  recalibrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python src/recalibrate.py
