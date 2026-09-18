@@ -1,7 +1,7 @@
 import os
 import requests
 import libsql
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -11,6 +11,13 @@ FINLAND_TZ = ZoneInfo("Europe/Helsinki")
 TURSO_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 MIN_SAMPLE_FOR_ADJUSTMENT = 50
+
+
+def is_biweekly_run_week():
+    """Tarkistaa onko kyseessä joka toinen viikko (parillinen ISO-viikkonumero),
+    jotta raportti lähtee vain kahden viikon välein, ei joka sunnuntai."""
+    week_number = datetime.now(FINLAND_TZ).isocalendar()[1]
+    return week_number % 2 == 0
 
 
 def get_connection():
@@ -46,6 +53,10 @@ def send_telegram_message(text):
 
 
 if __name__ == "__main__":
+    if not is_biweekly_run_week():
+        print("Ei kahden viikon välein osuva viikko - ohitetaan tämä ajo.")
+        exit(0)
+
     stats = get_cumulative_stats()
 
     lines = ["🔧 *Kahden viikon tarkistus*", ""]
