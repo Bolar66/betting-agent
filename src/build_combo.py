@@ -1,6 +1,7 @@
 import os
 import libsql
 import requests
+import traceback
 from math import prod
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -9,8 +10,16 @@ from dotenv import load_dotenv
 from win_model import (
     train_calibration_model,
     get_current_team_ratings,
+    get_current_nhl_season,
     predict_win_probability,
     calculate_edge,
+    build_h2h_rationale,
+    get_head_to_head_note,
+)
+from props_model import (
+    KNOWN_PLAYER_IDS,
+    calculate_calibrated_goal_probability,
+    calculate_prop_edge,
 )
 from check_results import check_and_update_results, get_results_summary
 
@@ -20,6 +29,10 @@ MAX_LEGS = 20
 MAX_ODDS = 250_000
 TARGET_MIN_ODDS = 10_000
 MIN_EDGE = 0.05
+
+COLD_STREAK_LOOKBACK_DAYS = 5
+COLD_STREAK_MIN_SAMPLES = 3
+COLD_STREAK_THRESHOLD = 0.30
 
 FINLAND_TZ = ZoneInfo("Europe/Helsinki")
 NIGHT_START_HOUR = 18
@@ -101,6 +114,43 @@ def save_sent_picks(conn, tier_key, result, sent_date):
     conn.commit()
 
 
+def get_cold_streak_warnings(conn):
+    """Tarkistaa onko jokin taso osunut heikosti viimeisimpien
+    COLD_STREAK_LOOKBACK_DAYS päivän aikana. Palauttaa listan
+    varoitustekstejä (tyhjä lista jos ei mitään huomautettavaa)."""
+    cutoff = (datetime.now(FINLAND_TZ).date() - timedelta(days=COLD_STREAK_LOOKBACK_DAYS)).isoformat()
+
+    cursor = conn.execute("""
+        SELECT tier, SUM(hit), COUNT(*)
+        FROM sent_picks
+        WHERE checked = 1 AND sent_date >= ?
+        GROUP BY tier
+    """, (cutoff,))
+
+    warnings = []
+    for tier, hits, total in cursor.fetchall():
+        hits = hits or 0
+        if total >= COLD_STREAK_MIN_SAMPLES:
+            rate = hits / total
+            if rate < COLD_STREAK_THRESHOLD:
+                warnings.append(
+                    f"{tier.upper()} on osunut vain {rate*100:.0f}% "
+                    f"viimeisen {COLD_STREAK_LOOKBACK_DAYS} päivän aikana ({hits}/{total})"
+                )
+    return warnings
+
+
+def format_cold_streak_warning(conn):
+    warnings = get_cold_streak_warnings(conn)
+    if not warnings:
+        return None
+    lines = ["🥶 *Huomio*", ""]
+    for w in warnings:
+        lines.append(escape_markdown(w))
+    lines.append("")
+    return "\n".join(lines)
+
+
 def get_latest_odds():
     conn = get_connection()
     cursor = conn.execute("""
@@ -118,7 +168,7 @@ def get_latest_odds():
     return cursor.fetchall()
 
 
-def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model):
+def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model, season):
     games = {}
     for game_id, home, away, commence, outcome_name, price in rows:
         games.setdefault(game_id, {
@@ -141,8 +191,11 @@ def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model
             }
             continue
 
+        game_date = datetime.fromisoformat(g["commence"].replace("Z", "+00:00")).astimezone(FINLAND_TZ).date()
+
         calibrated_prob, raw_prob, lam_home, lam_away = predict_win_probability(
-            home, away, ratings, league_avg, calibration_model
+            home, away, ratings, league_avg, calibration_model,
+            game_date=game_date, season=season
         )
 
         home_price = g["outcomes"].get(home)
@@ -156,10 +209,7 @@ def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model
         best_edge = max(home_edge, away_edge)
 
         if best_edge >= MIN_EDGE:
-            if home_edge >= away_edge:
-                pick, price = home, home_price
-            else:
-                pick, price = away, away_price
+            pick, price = (home, home_price) if home_edge >= away_edge else (away, away_price)
         else:
             pick, price = min([(home, home_price), (away, away_price)], key=lambda x: x[1])
 
@@ -174,21 +224,36 @@ def build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model
     return selections_by_game
 
 
-def add_mock_player_props(selections_by_game):
+def add_mock_player_props(selections_by_game, season):
+    """MOCK-DATA: korvataan oikealla haulla kun kausi alkaa. Vain
+    McDavidilla on varmistettu pelaaja-ID, joten vain hänelle lasketaan
+    kalibroitu todennäköisyys - muut käyttävät suoraan bookmaker-hintaa."""
     mock_props = {
         "9de33ce1013f2a3375dbded2c9fbc7d6": [
-            {"description": "Sebastian Aho tekee maalin", "market_type": "player_goal_scorer_anytime", "price": 2.20},
+            {"description": "Sebastian Aho tekee maalin", "market_type": "player_goal_scorer_anytime",
+             "price": 2.20, "player_name": "Sebastian Aho"},
         ],
         "485b295347cb22f002e014cb87813ed7": [
-            {"description": "Auston Matthews yli 0.5 pistettä", "market_type": "player_points", "price": 1.75},
+            {"description": "Auston Matthews yli 0.5 pistettä", "market_type": "player_points",
+             "price": 1.75, "player_name": "Auston Matthews"},
         ],
         "ac3cb11040dbdb0d2ccfa53e7d6b6cda": [
-            {"description": "David Pastrnak tekee maalin", "market_type": "player_goal_scorer_anytime", "price": 2.05},
+            {"description": "David Pastrnak tekee maalin", "market_type": "player_goal_scorer_anytime",
+             "price": 2.05, "player_name": "David Pastrnak"},
         ],
     }
     for game_id, props in mock_props.items():
-        if game_id in selections_by_game:
-            selections_by_game[game_id]["selections"].extend(props)
+        if game_id not in selections_by_game:
+            continue
+        for prop in props:
+            player_name = prop.get("player_name")
+            player_id = KNOWN_PLAYER_IDS.get(player_name)
+            if player_id and prop["market_type"] == "player_goal_scorer_anytime":
+                model_prob, sample_size = calculate_calibrated_goal_probability(player_id, season)
+                prop_edge = calculate_prop_edge(model_prob, prop["price"])
+                prop["_model_prob"] = model_prob
+                prop["_edge"] = prop_edge
+            selections_by_game[game_id]["selections"].append(prop)
     return selections_by_game
 
 
@@ -319,8 +384,7 @@ def format_results_report(results_summary):
     lines = ["📊 *Edellisyön tulokset*", ""]
     for tier, hits, total in results_summary:
         hits = hits or 0
-        line = escape_markdown(f"{tier.upper()}: {hits}/{total} osui")
-        lines.append(line)
+        lines.append(escape_markdown(f"{tier.upper()}: {hits}/{total} osui"))
     lines.append("")
     return "\n".join(lines)
 
@@ -336,63 +400,86 @@ def send_telegram_message(text):
     })
     response.raise_for_status()
 
+
+def send_error_alert(error_text):
+    """Lähettää virheilmoituksen ilman Markdown-muotoilua, jotta itse
+    virheviesti ei kaada myös tätä lähetystä."""
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        requests.post(url, data={
+            "chat_id": chat_id,
+            "text": f"⚠️ Botti epäonnistui tänään:\n\n{error_text[:500]}",
+        })
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    if already_sent_today():
-        print("Viesti jo lähetetty tänään - ohitetaan tämä ajo.")
-        exit(0)
+    try:
+        if already_sent_today():
+            print("Viesti jo lähetetty tänään - ohitetaan tämä ajo.")
+            exit(0)
 
-    # Varmistetaan että sent_picks-taulu on olemassa ennen kuin
-    # yritetään lukea/kirjoittaa siihen
-    init_sent_picks_table(get_connection())
+        conn = get_connection()
+        init_sent_picks_table(conn)
 
-    # Tarkistetaan edellisyön tulokset ennen uuden lapun rakentamista
-    print("Tarkistetaan edellisyön tulokset...")
-    check_and_update_results()
+        print("Tarkistetaan edellisyön tulokset...")
+        check_and_update_results()
+        results_summary = get_results_summary()
+        results_text = format_results_report(results_summary)
+        cold_streak_text = format_cold_streak_warning(conn)
 
-    results_summary = get_results_summary()
-    results_text = format_results_report(results_summary)
+        season = get_current_nhl_season()
+        print(f"Käytetään kautta: {season}")
 
-    print("Koulutetaan kalibrointimalli...")
-    calibration_model = train_calibration_model()
-    ratings, league_avg = get_current_team_ratings()
+        print("Koulutetaan kalibrointimalli...")
+        calibration_model = train_calibration_model()
+        ratings, league_avg = get_current_team_ratings(season)
 
-    rows = get_latest_odds()
-    selections_by_game = build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model)
-    selections_by_game = add_mock_player_props(selections_by_game)  # TODO: korvaa oikealla haulla
+        rows = get_latest_odds()
+        selections_by_game = build_h2h_selections_with_model(rows, ratings, league_avg, calibration_model, season)
+        selections_by_game = add_mock_player_props(selections_by_game, season)  # TODO: korvaa oikealla haulla
 
-    legs = build_bet_builder_legs(selections_by_game)
-    legs, window_start, window_end = filter_to_next_night(legs)
+        legs = build_bet_builder_legs(selections_by_game)
+        legs, window_start, window_end = filter_to_next_night(legs)
 
-    print(f"Löytyi {len(legs)} legiä tälle yölle.\n")
 
-    date_range = escape_markdown(format_date_range(legs))
+        print(f"Löytyi {len(legs)} legiä tälle yölle.\n")
 
-    message_parts = []
-    if results_text:
-        message_parts.append(results_text)
-    message_parts.append(f"🏒 *NHL LAPUT — {date_range}* 🏒")
-    message_parts.append("")
+        date_range = escape_markdown(format_date_range(legs))
 
-    conn = get_connection()
-    init_sent_picks_table(conn)
-    today = datetime.now(FINLAND_TZ).date().isoformat()
-
-    for tier_key, tier_config in SLIP_TIERS.items():
-        result = build_slip_tiered(
-            legs, tier_config["min_odds"], tier_config["max_odds"],
-            tier_config["min_legs"], tier_config["max_legs"]
-        )
-        message_parts.append(format_slip_markdown(tier_key, tier_config, result))
+        message_parts = []
+        if results_text:
+            message_parts.append(results_text)
+        if cold_streak_text:
+            message_parts.append(cold_streak_text)
+        message_parts.append(f"🏒 *NHL LAPUT — {date_range}* 🏒")
         message_parts.append("")
 
-        save_sent_picks(conn, tier_key, result, today)
+        today = datetime.now(FINLAND_TZ).date().isoformat()
 
-        print(f"--- {tier_key.upper()} ---")
-        if result:
-            print(f"{len(result['legs'])} kohdetta, kerroin {result['total_odds']:.1f}")
-        else:
-            print("Ei löytynyt sopivaa lappua.")
+        for tier_key, tier_config in SLIP_TIERS.items():
+            result = build_slip_tiered(
+                legs, tier_config["min_odds"], tier_config["max_odds"],
+                tier_config["min_legs"], tier_config["max_legs"]
+            )
+            message_parts.append(format_slip_markdown(tier_key, tier_config, result))
+            message_parts.append("")
+            save_sent_picks(conn, tier_key, result, today)
 
-    message = "\n".join(message_parts)
-    send_telegram_message(message)
-    mark_sent_today()
+            print(f"--- {tier_key.upper()} ---")
+            if result:
+                print(f"{len(result['legs'])} kohdetta, kerroin {result['total_odds']:.1f}")
+            else:
+                print("Ei löytynyt sopivaa lappua.")
+
+        message = "\n".join(message_parts)
+        send_telegram_message(message)
+        mark_sent_today()
+
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(error_details)
+        send_error_alert(f"{type(e).__name__}: {str(e)}")
