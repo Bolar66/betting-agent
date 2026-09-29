@@ -36,6 +36,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Fetch SGO odds (data collection)
+        continue-on-error: true
+        env:
+          SGO_API_KEY: ${{ secrets.SGO_API_KEY }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: python src/fetch_sgo.py
+
       - name: Fetch odds
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
