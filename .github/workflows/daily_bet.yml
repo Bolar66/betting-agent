@@ -44,20 +44,12 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: python src/collect_results.py
 
-      - name: Fetch SGO odds (data collection)
-        continue-on-error: true
+      - name: Fetch SGO odds
         env:
           SGO_API_KEY: ${{ secrets.SGO_API_KEY }}
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: python src/fetch_sgo.py
-
-      - name: Fetch odds
-        env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
-          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-        run: python src/fetch_odds.py
 
       - name: Build and send slip
         env:
