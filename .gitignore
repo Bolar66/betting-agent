@@ -221,3 +221,5 @@ __marimo__/
 data/*.db
 data/*.sqlite
 .venv/
+
+src/*sample*.json

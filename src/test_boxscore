@@ -1,0 +1,19 @@
+import json
+from check_results import get_nhl_scores_for_date
+import requests
+
+games = get_nhl_scores_for_date("2026-09-29")
+final = [g for g in games if g.get("gameState") in ("OFF", "FINAL")]
+print(f"Päättyneitä otteluita 29.9.: {len(final)}")
+for g in final:
+    print(f"  {g['awayTeam']['abbrev']} {g['awayTeam']['score']} - "
+          f"{g['homeTeam']['score']} {g['homeTeam']['abbrev']}")
+
+gid = final[0]["id"]
+box = requests.get(f"https://api-web.nhle.com/v1/gamecenter/{gid}/boxscore", timeout=30).json()
+stats = box.get("playerByGameStats", {}).get("homeTeam", {})
+for group in ("forwards", "defense", "goalies"):
+    players = stats.get(group, [])
+    if players:
+        print(f"\n{group} ({len(players)}), esimerkki:")
+        print(json.dumps(players[0], ensure_ascii=False, indent=1)[:700])
