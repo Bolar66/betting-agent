@@ -17,6 +17,7 @@ load_dotenv()
 DRY_RUN = os.getenv("DRY_RUN") == "1"
 
 MAX_SELECTIONS = 20          # sivuston raja valinnoille yhdellä lapulla
+MAX_PER_GAME_LIMIT = 4       # sivuston raja valinnoille samasta pelistä
 MIN_EV = 0.92                # todennäköisyys * kerroin vähintään tämä (karsii huonot hinnat)
 ALLOW_PLAYER_UNDERS = False  # pelaajien alle-vedot pois
 
@@ -222,7 +223,10 @@ def make_selection(row, prob):
             if side == "under" and not ALLOW_PLAYER_UNDERS:
                 return None
             if side == "over":
-                desc = f"{subject}: {PLAYER_STATS[stat]} {math.floor(point) + 1}+"
+                if point < 1:
+                    desc = f"{subject} {YES_TEXT[stat]}"   # yli 0,5 = sama kuin "kyllä"
+                else:
+                    desc = f"{subject}: {PLAYER_STATS[stat]} {math.floor(point) + 1}+"
             elif side == "under":
                 desc = f"{subject}: {PLAYER_STATS[stat]} alle {point:g}"
             else:
@@ -342,7 +346,22 @@ def build_slip(games, cfg):
         "total_odds": total,
         "total_prob": prod(s["prob"] for s in chosen),
         "reached_target": total >= cfg["min_odds"],
+        "max_per_game": cfg["max_per_game"],
     }
+
+
+def build_slip_flexible(games, cfg):
+    """Kokeilee tason omalla per peli -rajalla. Jos haarukka ei täyty
+    (hiljainen ilta), sallitaan yksi valinta lisää per peli kerrallaan,
+    kunnes raja MAX_PER_GAME_LIMIT tulee vastaan."""
+    result = None
+    for mpg in range(cfg["max_per_game"], MAX_PER_GAME_LIMIT + 1):
+        attempt = build_slip(games, {**cfg, "max_per_game": mpg})
+        if attempt is not None:
+            result = attempt
+        if attempt is not None and attempt["reached_target"]:
+            break
+    return result
 
 
 # ---------- viestin muotoilu ----------
@@ -486,13 +505,14 @@ if __name__ == "__main__":
             message_parts.append("")
 
             for tier_key, cfg in SLIP_TIERS.items():
-                result = build_slip(games, cfg)
+                result = build_slip_flexible(games, cfg)
                 tier_results[tier_key] = result
                 message_parts.append(format_slip_markdown(tier_key, cfg, result))
                 message_parts.append("")
                 if result:
                     print(f"--- {tier_key.upper()}: {result['n_sel']} valintaa, "
-                          f"{len(result['legs'])} peliä, kerroin {result['total_odds']:.1f}")
+                          f"{len(result['legs'])} peliä, kerroin {result['total_odds']:.1f}, "
+                          f"max {result['max_per_game']}/peli")
                 else:
                     print(f"--- {tier_key.upper()}: ei lappua")
 
