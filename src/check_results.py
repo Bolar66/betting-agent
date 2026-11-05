@@ -1,18 +1,10 @@
-import os
 import json
 import unicodedata
 import requests
-import libsql
 from datetime import timedelta
-from dotenv import load_dotenv
 
+from common import get_connection, TEAM_ABBREV_MAP
 from night_window import FINLAND_TZ, get_now_utc, parse_utc
-from win_model import TEAM_ABBREV_MAP
-
-load_dotenv()
-
-TURSO_URL = os.getenv("TURSO_DATABASE_URL")
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 IGNORED_NAME_TOKENS = {"jr", "sr", "ii", "iii"}
 
@@ -24,10 +16,6 @@ STAT_FIELDS = {
     "shots_on_goal": "sog",
     "goalie_saves": "saves",
 }
-
-
-def get_connection():
-    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
 
 
 def nhl_date_for(commence_iso):
@@ -56,10 +44,16 @@ def player_key(name):
     return f"{tokens[0][0]} {tokens[-1]}"
 
 
+def fetch_boxscore(nhl_game_id):
+    url = f"https://api-web.nhle.com/v1/gamecenter/{nhl_game_id}/boxscore"
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
 def fetch_game_stats(nhl_game_id):
     """Palauttaa {(joukkue, pelaaja-avain): tilastot} ottelun boxscoresta."""
-    url = f"https://api-web.nhle.com/v1/gamecenter/{nhl_game_id}/boxscore"
-    box = requests.get(url, timeout=30).json()
+    box = fetch_boxscore(nhl_game_id)
     stats = box.get("playerByGameStats", {})
     players = {}
     for side in ("homeTeam", "awayTeam"):
@@ -135,8 +129,8 @@ def evaluate_selection(sel, home_ab, away_ab, hs, as_, get_stats):
     return None
 
 
-def check_and_update_results():
-    conn = get_connection()
+def check_and_update_results(conn=None):
+    conn = conn or get_connection()
     rows = conn.execute("""
         SELECT id, home_team, away_team, commence_time, selections_json
         FROM sent_picks
@@ -198,9 +192,9 @@ def check_and_update_results():
     conn.commit()
 
 
-def get_results_summary():
+def get_results_summary(conn=None):
     """(taso, osuneet, tarkistetut, kaikki) eilen lähetetyille lapuille."""
-    conn = get_connection()
+    conn = conn or get_connection()
     yesterday = (get_now_utc().astimezone(FINLAND_TZ).date() - timedelta(days=1)).isoformat()
     return conn.execute("""
         SELECT tier,

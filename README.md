@@ -56,9 +56,9 @@ The project is under active development. Model quality, calibration, coverage of
 | Area | Technologies / approach |
 | --- | --- |
 | Language | Python |
-| Data processing | pandas, NumPy |
+| Data processing | pandas, NumPy (legacy models) |
 | Statistical modelling | Poisson distributions, probability estimation and calibration |
-| Machine learning | scikit-learn, including logistic regression and gradient boosting components |
+| Machine learning | scikit-learn, including logistic regression and gradient boosting components (legacy models) |
 | Data storage | Turso / libSQL |
 | API integration | `requests`, external NHL and odds data APIs |
 | Configuration | Environment variables and `python-dotenv` |
@@ -74,18 +74,23 @@ The project is under active development. Model quality, calibration, coverage of
 │   └── recalibrate.yml        # Periodic results / calibration report
 ├── data/                      # Placeholder for local data
 ├── notebooks/                 # Placeholder for exploratory notebooks
-├── src/
-│   ├── build_combo.py         # Builds candidate selections and reports
-│   ├── check_results.py       # Checks recorded selections against results
-│   ├── collect_results.py    # Collects historical results and statistics
-│   ├── fetch_sgo.py           # Fetches odds from the SGO API
+├── legacy/                    # Earlier Odds API code and ML experiments (not in the daily run)
 │   ├── fetch_odds.py          # Fetches odds from another odds API
 │   ├── market_model.py        # Market probability calculations
 │   ├── poisson_model.py       # Poisson-based match estimates
 │   ├── props_model.py         # Player-prop probability calculations
 │   ├── train_model.py         # Model training and evaluation workflow
 │   ├── win_model.py           # Match outcome model utilities
-│   └── recalibrate.py         # Periodic reporting workflow
+│   └── requirements.txt       # Extra dependencies (pandas, scikit-learn, ...)
+├── src/
+│   ├── common.py              # Shared DB, bot state, Telegram and team-name helpers
+│   ├── collect_results.py     # Collects closing odds and player stats after games
+│   ├── fetch_sgo.py           # Fetches odds from the SGO API
+│   ├── build_combo.py         # Builds candidate selections and reports
+│   ├── check_results.py       # Checks recorded selections against results
+│   ├── recalibrate.py         # Periodic reporting workflow
+│   ├── export_db.py           # Exports the database to local SQLite / CSV
+│   └── reset_state.py         # Allows re-sending today's report
 ├── .env.example               # Environment-variable template
 ├── requirements.txt           # Python dependencies
 └── README.md
@@ -129,6 +134,8 @@ Install dependencies:
 ```bash
 python -m pip install -r requirements.txt
 ```
+
+The daily pipeline needs only `requirements.txt`. To run the legacy models, also install `legacy/requirements.txt` and set `PYTHONPATH=src`.
 
 ### 3. Configure environment variables
 
@@ -177,7 +184,7 @@ Add `ODDS_API_KEY` only if you plan to run workflows or scripts that require it.
 - Probability estimates are model outputs, not guarantees. Historical results do not ensure future performance.
 - Before drawing conclusions about model performance, use time-aware backtesting, calibration metrics, and an adequate out-of-sample period.
 - API availability, rate limits, and data quality can affect the pipeline.
-- The repository contains exploratory and diagnostic scripts as well as the main workflow; not every script is intended to be run as part of the daily job.
+- The daily job runs `collect_results.py`, `fetch_sgo.py` and `build_combo.py`. Earlier models and experiments live in `legacy/` and are not part of the daily job.
 
 ## Responsible use
 

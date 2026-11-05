@@ -1,32 +1,23 @@
 import os
 import sys
 import requests
-import libsql
 from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
 
+from common import (get_connection, init_state_table, get_state, set_state, insert_many,
+                    TEAM_ABBREV_MAP)
 from night_window import get_now_utc, get_next_night_window, today_fi
-from check_results import nhl_date_for, get_nhl_scores_for_date, player_key
-from win_model import TEAM_ABBREV_MAP
-from fetch_sgo import (american_to_decimal, to_float, get_start, get_usage,
-                       get_state, set_state, PLAYER_STAT_NAMES)
+from check_results import nhl_date_for, get_nhl_scores_for_date, player_key, fetch_boxscore
+from fetch_sgo import (API_KEY, BASE, american_to_decimal, get_start, get_usage,
+                       classify_odd, event_teams, count_books)
 
-load_dotenv()
-
-API_KEY = os.getenv("SGO_API_KEY")
-BASE = "https://api.sportsgameodds.com/v2"
-TURSO_URL = os.getenv("TURSO_DATABASE_URL")
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 FORCE = os.getenv("COLLECT_FORCE") == "1"
 
-CLOSE_COLUMNS = ("(event_id, home_team, away_team, commence_time, market_key, subject, "
-                 "subject_team, side, point, close_price, close_fair, n_books, collected_at)")
-STAT_COLUMNS = ("(nhl_game_id, event_id, game_date, team, player_name, player_key, position, "
-                "goals, assists, points, sog, blocks, hits, pp_goals, saves, starter)")
-
-
-def get_connection():
-    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+CLOSE_COLUMNS = ("event_id", "home_team", "away_team", "commence_time", "market_key", "subject",
+                 "subject_team", "side", "point", "close_price", "close_fair", "n_books",
+                 "collected_at")
+STAT_COLUMNS = ("nhl_game_id", "event_id", "game_date", "team", "player_name", "player_key",
+                "position", "goals", "assists", "points", "sog", "blocks", "hits", "pp_goals",
+                "saves", "starter")
 
 
 def init_tables(conn):
@@ -47,46 +38,11 @@ def init_tables(conn):
             hits INTEGER, pp_goals INTEGER, saves INTEGER, starter INTEGER
         )
     """)
-    conn.execute("CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT)")
+    # Tarkistukset "onko jo tallennettu" käyttävät näitä
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sgo_closing_event ON sgo_closing(event_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pgs_game ON player_game_stats(nhl_game_id)")
     conn.commit()
-
-
-def classify_odd(ev, odd, home, away, team_names):
-    """Sama markkinaluokittelu kuin fetch_sgo.py:ssä.
-    Palauttaa (market_key, subject, subject_team, side, point) tai None."""
-    if odd.get("periodID") != "game" or odd.get("cancelled"):
-        return None
-    stat, ent = odd.get("statID"), odd.get("statEntityID")
-    bet, side = odd.get("betTypeID"), odd.get("sideID")
-
-    # Sulkeutumislinja, jos SGO antaa sen; muuten viimeisin linja (kenttänimeä ei varmistettu)
-    if bet == "ou":
-        point = to_float(odd.get("closeBookOverUnder") or odd.get("bookOverUnder"))
-    elif bet == "sp":
-        point = to_float(odd.get("closeBookSpread") or odd.get("bookSpread"))
-    else:
-        point = None
-
-    if ent in ("home", "away", "all"):
-        subject = home if ent == "home" else away if ent == "away" else "all"
-        subject_team = subject if ent != "all" else None
-        if stat == "points":
-            key = {"ml": "h2h", "sp": "spreads",
-                   "ou": "totals" if ent == "all" else "team_totals"}.get(bet)
-            if key is None:
-                return None
-        else:
-            key = f"team_{stat}_{bet}"
-    else:
-        player = (ev.get("players") or {}).get(ent)
-        if not player:
-            return None
-        if bet == "yn" and side != "yes":
-            return None
-        subject = player.get("name")
-        subject_team = team_names.get(player.get("teamID"))
-        key = f"player_{PLAYER_STAT_NAMES.get(stat, stat)}_{bet}"
-    return key, subject, subject_team, side, point
+    init_state_table(conn)
 
 
 def fetch_ended_events(window_start, window_end):
@@ -99,34 +55,21 @@ def fetch_ended_events(window_start, window_end):
     return [e for e in events if (e.get("status") or {}).get("completed")]
 
 
-def insert_many(conn, table, columns, rows, n_cols, chunk=50):
-    for i in range(0, len(rows), chunk):
-        part = rows[i:i + chunk]
-        ph = "(" + ",".join(["?"] * n_cols) + ")"
-        placeholders = ",".join([ph] * len(part))
-        params = tuple(v for row in part for v in row)
-        conn.execute(f"INSERT INTO {table} {columns} VALUES {placeholders}", params)
-    conn.commit()
-
-
 def closing_rows(ev, collected_at):
-    home = ev["teams"]["home"]["names"]["long"]
-    away = ev["teams"]["away"]["names"]["long"]
-    team_names = {ev["teams"][s]["teamID"]: ev["teams"][s]["names"]["long"] for s in ("home", "away")}
+    home, away, team_names = event_teams(ev)
     commence = get_start(ev)
     rows = []
     for odd in (ev.get("odds") or {}).values():
         price = american_to_decimal(odd.get("closeBookOdds"))
         if not price:
             continue
-        info = classify_odd(ev, odd, home, away, team_names)
+        info = classify_odd(ev, odd, home, away, team_names, closing=True)
         if info is None:
             continue
         key, subject, subject_team, side, point = info
         fair = american_to_decimal(odd.get("closeFairOdds"))
-        n_books = sum(1 for b in (odd.get("byBookmaker") or {}).values() if b.get("available"))
         rows.append((ev["eventID"], home, away, commence, key, subject, subject_team,
-                     side, point, price, fair, n_books, collected_at))
+                     side, point, price, fair, count_books(odd), collected_at))
     return rows
 
 
@@ -145,7 +88,7 @@ def player_rows(ev, nhl_games_by_date):
         return None
 
     gid = match["id"]
-    box = requests.get(f"https://api-web.nhle.com/v1/gamecenter/{gid}/boxscore", timeout=30).json()
+    box = fetch_boxscore(gid)
     stats = box.get("playerByGameStats", {})
     rows = []
     for side_key, ab in (("homeTeam", home_ab), ("awayTeam", away_ab)):
@@ -192,7 +135,7 @@ if __name__ == "__main__":
 
         if conn.execute("SELECT 1 FROM sgo_closing WHERE event_id = ? LIMIT 1", (eid,)).fetchone() is None:
             rows = closing_rows(ev, collected_at)
-            insert_many(conn, "sgo_closing", CLOSE_COLUMNS, rows, 13)
+            insert_many(conn, "sgo_closing", CLOSE_COLUMNS, rows)
             n_close += len(rows)
 
         try:
@@ -205,7 +148,7 @@ if __name__ == "__main__":
             continue
         gid, rows = result
         if conn.execute("SELECT 1 FROM player_game_stats WHERE nhl_game_id = ? LIMIT 1", (gid,)).fetchone() is None:
-            insert_many(conn, "player_game_stats", STAT_COLUMNS, rows, 16)
+            insert_many(conn, "player_game_stats", STAT_COLUMNS, rows)
             n_players += len(rows)
 
     set_state(conn, "collect_last_date", today)

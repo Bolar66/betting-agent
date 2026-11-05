@@ -1,15 +1,10 @@
-import os
-import requests
-import libsql
+import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
 
-load_dotenv()
+from common import get_connection, escape_markdown, send_telegram_message
 
 FINLAND_TZ = ZoneInfo("Europe/Helsinki")
-TURSO_URL = os.getenv("TURSO_DATABASE_URL")
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 MIN_SAMPLE_FOR_ADJUSTMENT = 50
 
 
@@ -18,10 +13,6 @@ def is_biweekly_run_week():
     jotta raportti lähtee vain kahden viikon välein, ei joka sunnuntai."""
     week_number = datetime.now(FINLAND_TZ).isocalendar()[1]
     return week_number % 2 == 0
-
-
-def get_connection():
-    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
 
 
 def get_cumulative_stats():
@@ -35,27 +26,10 @@ def get_cumulative_stats():
     return cursor.fetchall()
 
 
-def escape_markdown(text):
-    special_chars = r"_*[]()~`>#+-=|{}.!"
-    for char in special_chars:
-        text = text.replace(char, f"\\{char}")
-    return text
-
-
-def send_telegram_message(text):
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    response = requests.post(url, data={
-        "chat_id": chat_id, "text": text, "parse_mode": "MarkdownV2",
-    })
-    response.raise_for_status()
-
-
 if __name__ == "__main__":
     if not is_biweekly_run_week():
         print("Ei kahden viikon välein osuva viikko - ohitetaan tämä ajo.")
-        exit(0)
+        sys.exit(0)
 
     stats = get_cumulative_stats()
 

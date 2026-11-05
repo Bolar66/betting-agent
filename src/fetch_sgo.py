@@ -1,19 +1,14 @@
 import os
 import sys
 import requests
-import libsql
 from collections import Counter
 from datetime import datetime, timezone
-from dotenv import load_dotenv
 
+from common import get_connection, init_state_table, get_state, set_state, insert_many
 from night_window import get_now_utc, get_next_night_window, parse_utc, today_fi
-
-load_dotenv()
 
 API_KEY = os.getenv("SGO_API_KEY")
 BASE = "https://api.sportsgameodds.com/v2"
-TURSO_URL = os.getenv("TURSO_DATABASE_URL")
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 PAGE_LIMIT = 20
 MAX_PAGES = 3   # suojaa kiintiötä, jos aikarajaus ei toimikaan
@@ -30,12 +25,8 @@ PLAYER_STAT_NAMES = {
     "lastToScore": "last_goal",
 }
 
-COLUMNS = ("(event_id, home_team, away_team, commence_time, market_key, subject, "
-           "subject_team, side, point, price, fair_price, n_books, fetched_at)")
-
-
-def get_connection():
-    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+COLUMNS = ("event_id", "home_team", "away_team", "commence_time", "market_key", "subject",
+           "subject_team", "side", "point", "price", "fair_price", "n_books", "fetched_at")
 
 
 def init_tables(conn):
@@ -57,21 +48,8 @@ def init_tables(conn):
             fetched_at TEXT
         )
     """)
-    conn.execute("CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
-
-
-def get_state(conn, key):
-    row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
-    return row[0] if row else None
-
-
-def set_state(conn, key, value):
-    conn.execute("""
-        INSERT INTO bot_state (key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    """, (key, value))
-    conn.commit()
+    init_state_table(conn)
 
 
 def american_to_decimal(value):
@@ -141,24 +119,34 @@ def fetch_events(window_start, window_end):
     return events
 
 
-def odd_to_row(ev, odd, home, away, team_names, fetched_at, commence):
-    if odd.get("periodID") != "game":
-        return None
-    if not odd.get("bookOddsAvailable") or odd.get("cancelled") or odd.get("started"):
-        return None
+def event_teams(ev):
+    """(koti, vieras, {teamID: koko nimi})"""
+    home = ev["teams"]["home"]["names"]["long"]
+    away = ev["teams"]["away"]["names"]["long"]
+    team_names = {ev["teams"][s]["teamID"]: ev["teams"][s]["names"]["long"] for s in ("home", "away")}
+    return home, away, team_names
 
-    price = american_to_decimal(odd.get("bookOdds"))
-    if not price:
+
+def count_books(odd):
+    return sum(1 for b in (odd.get("byBookmaker") or {}).values() if b.get("available"))
+
+
+def classify_odd(ev, odd, home, away, team_names, closing=False):
+    """Luokittelee SGO-kertoimen meidän markkinaksi.
+    Palauttaa (market_key, subject, subject_team, side, point) tai None.
+    closing=True käyttää sulkeutumislinjaa (jos SGO antaa) ja sallii alkaneet ottelut."""
+    if odd.get("periodID") != "game" or odd.get("cancelled"):
         return None
-    fair = american_to_decimal(odd.get("fairOdds"))
+    if not closing and (not odd.get("bookOddsAvailable") or odd.get("started")):
+        return None
 
     stat, ent = odd.get("statID"), odd.get("statEntityID")
     bet, side = odd.get("betTypeID"), odd.get("sideID")
 
     if bet == "ou":
-        point = to_float(odd.get("bookOverUnder"))
+        point = to_float((closing and odd.get("closeBookOverUnder")) or odd.get("bookOverUnder"))
     elif bet == "sp":
-        point = to_float(odd.get("bookSpread"))
+        point = to_float((closing and odd.get("closeBookSpread")) or odd.get("bookSpread"))
     else:
         point = None
 
@@ -181,19 +169,20 @@ def odd_to_row(ev, odd, home, away, team_names, fetched_at, commence):
         subject = player.get("name")
         subject_team = team_names.get(player.get("teamID"))
         key = f"player_{PLAYER_STAT_NAMES.get(stat, stat)}_{bet}"
+    return key, subject, subject_team, side, point
 
-    n_books = sum(1 for b in (odd.get("byBookmaker") or {}).values() if b.get("available"))
+
+def odd_to_row(ev, odd, home, away, team_names, fetched_at, commence):
+    price = american_to_decimal(odd.get("bookOdds"))
+    if not price:
+        return None
+    info = classify_odd(ev, odd, home, away, team_names)
+    if info is None:
+        return None
+    key, subject, subject_team, side, point = info
+    fair = american_to_decimal(odd.get("fairOdds"))
     return (ev["eventID"], home, away, commence, key, subject, subject_team,
-            side, point, price, fair, n_books, fetched_at)
-
-
-def insert_rows(conn, rows, chunk=50):
-    for i in range(0, len(rows), chunk):
-        part = rows[i:i + chunk]
-        placeholders = ",".join(["(?,?,?,?,?,?,?,?,?,?,?,?,?)"] * len(part))
-        params = tuple(v for row in part for v in row)
-        conn.execute(f"INSERT INTO sgo_odds {COLUMNS} VALUES {placeholders}", params)
-    conn.commit()
+            side, point, price, fair, count_books(odd), fetched_at)
 
 
 if __name__ == "__main__":
@@ -226,15 +215,13 @@ if __name__ == "__main__":
             outside += 1
             continue
         tonight += 1
-        home = ev["teams"]["home"]["names"]["long"]
-        away = ev["teams"]["away"]["names"]["long"]
-        team_names = {ev["teams"][s]["teamID"]: ev["teams"][s]["names"]["long"] for s in ("home", "away")}
+        home, away, team_names = event_teams(ev)
         for odd in ev.get("odds", {}).values():
             row = odd_to_row(ev, odd, home, away, team_names, fetched_at, start)
             if row:
                 rows.append(row)
 
-    insert_rows(conn, rows)
+    insert_many(conn, "sgo_odds", COLUMNS, rows)
     set_state(conn, "sgo_last_fetch_date", today)
     used_after = get_usage()
 

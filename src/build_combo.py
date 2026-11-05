@@ -2,17 +2,14 @@ import os
 import sys
 import json
 import math
-import libsql
-import requests
 import traceback
 from math import prod
 from datetime import timedelta
-from dotenv import load_dotenv
 
+from common import (get_connection, init_state_table, get_state, set_state,
+                    escape_markdown, send_telegram_message, send_error_alert)
 from night_window import FINLAND_TZ, get_now_utc, get_next_night_window, today_fi, parse_utc
 from check_results import check_and_update_results, get_results_summary
-
-load_dotenv()
 
 DRY_RUN = os.getenv("DRY_RUN") == "1"
 
@@ -21,13 +18,19 @@ MAX_PER_GAME_LIMIT = 4       # sivuston raja valinnoille samasta pelistä
 MIN_EV = 0.92                # todennäköisyys * kerroin vähintään tämä (karsii huonot hinnat)
 ALLOW_PLAYER_UNDERS = False  # pelaajien alle-vedot pois
 
+# Yksittäisen valinnan rajat kaikilla tasoilla. Data 29.9.-1.11.2026: valinnat
+# kertoimella 5+ / todennäköisyydellä < 20 % osuivat 11 % (arvio 17 %), ROI -35 %.
+# Pitkät kertoimet kerätään mieluummin useammasta kohtuullisesta valinnasta.
+MAX_LEG_PRICE = 4.0
+MIN_LEG_PROB = 0.25
+
 SLIP_TIERS = {
     "chilli": {"emoji": "🧊", "min_odds": 100, "max_odds": 1_000,
                "min_prob": 0.55, "max_per_game": 2},
     "perus":  {"emoji": "⚖️", "min_odds": 1_000, "max_odds": 8_000,
                "min_prob": 0.35, "max_per_game": 3},
     "testo":  {"emoji": "🔥", "min_odds": 75_000, "max_odds": 250_000,
-               "min_prob": 0.15, "max_per_game": 4},
+               "min_prob": MIN_LEG_PROB, "max_per_game": 4},
 }
 
 # Pelaajatilastot, jotka voidaan tarkistaa boxscoresta
@@ -50,35 +53,7 @@ COLD_STREAK_LOOKBACK_DAYS = 5
 COLD_STREAK_MIN_SAMPLES = 15
 COLD_STREAK_THRESHOLD = 0.30
 
-TURSO_URL = os.getenv("TURSO_DATABASE_URL")
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
-
-
 # ---------- tietokanta ja tila ----------
-
-def get_connection():
-    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
-
-
-def init_state_table():
-    conn = get_connection()
-    conn.execute("CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT)")
-    conn.commit()
-    return conn
-
-
-def get_state(conn, key):
-    row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
-    return row[0] if row else None
-
-
-def set_state(conn, key, value):
-    conn.execute("""
-        INSERT INTO bot_state (key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    """, (key, value))
-    conn.commit()
-
 
 def already_sent_today(conn):
     return get_state(conn, "last_sent_date") == today_fi().isoformat()
@@ -88,8 +63,7 @@ def mark_sent_today(conn):
     set_state(conn, "last_sent_date", today_fi().isoformat())
 
 
-def init_sent_picks_table():
-    conn = get_connection()
+def init_sent_picks_table(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sent_picks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,12 +81,6 @@ def init_sent_picks_table():
         )
     """)
     conn.commit()
-    try:
-        c = get_connection()
-        c.execute("ALTER TABLE sent_picks ADD COLUMN selections_json TEXT")
-        c.commit()
-    except Exception:
-        pass
 
 
 def save_sent_picks(conn, tier_key, result, sent_date):
@@ -120,7 +88,9 @@ def save_sent_picks(conn, tier_key, result, sent_date):
         return
     for leg in result["legs"]:
         selections = [
-            {k: s.get(k) for k in ("type", "team", "point", "side", "player", "stat")}
+            # prob/price/ev talteen, jotta kalibrointi voidaan analysoida suoraan
+            {k: s.get(k) for k in ("type", "team", "point", "side", "player", "stat",
+                                   "price", "prob", "ev")}
             for s in leg["selections"]
         ]
         conn.execute("""
@@ -299,7 +269,8 @@ def conflicts(sel, gs, cfg):
 def build_slip(games, cfg):
     pool = [
         s for g in games.values() for s in g["selections"]
-        if s["prob"] >= cfg["min_prob"] and s["ev"] >= MIN_EV
+        if s["prob"] >= max(cfg["min_prob"], MIN_LEG_PROB) and s["ev"] >= MIN_EV
+        and s["price"] <= MAX_LEG_PRICE
     ]
     pool.sort(key=cost_ratio)
 
@@ -366,12 +337,6 @@ def build_slip_flexible(games, cfg):
 
 # ---------- viestin muotoilu ----------
 
-def escape_markdown(text):
-    for char in r"_*[]()~`>#+-=|{}.!":
-        text = text.replace(char, f"\\{char}")
-    return text
-
-
 def format_date_range(items):
     dates = sorted({parse_utc(i["commence"]).astimezone(FINLAND_TZ).date() for i in items})
     if not dates:
@@ -430,42 +395,6 @@ def format_cold_streak_warning(conn):
     return "\n".join(["🥶 *Huomio*", ""] + [escape_markdown(w) for w in warnings] + [""])
 
 
-# ---------- Telegram ----------
-
-def send_telegram_message(text):
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-
-    chunks, current = [], ""
-    for block in text.split("\n\n"):
-        if current and len(current) + len(block) + 2 > 3500:
-            chunks.append(current)
-            current = block
-        else:
-            current = f"{current}\n\n{block}" if current else block
-    if current:
-        chunks.append(current)
-
-    for chunk in chunks:
-        response = requests.post(url, data={
-            "chat_id": chat_id, "text": chunk, "parse_mode": "MarkdownV2",
-        })
-        response.raise_for_status()
-
-
-def send_error_alert(error_text):
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    try:
-        requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", data={
-            "chat_id": chat_id,
-            "text": f"⚠️ Botti epäonnistui tänään:\n\n{error_text[:500]}",
-        })
-    except Exception:
-        pass
-
-
 # ---------- pääohjelma ----------
 
 if __name__ == "__main__":
@@ -473,16 +402,17 @@ if __name__ == "__main__":
         if os.getenv("FAKE_NOW") and not DRY_RUN:
             sys.exit("FAKE_NOW vaatii DRY_RUN=1.")
 
-        conn = init_state_table()
-        init_sent_picks_table()
+        conn = get_connection()
+        init_state_table(conn)
+        init_sent_picks_table(conn)
 
         if not DRY_RUN and already_sent_today(conn):
             print("Viesti jo lähetetty tänään - ohitetaan tämä ajo.")
             sys.exit(0)
 
         print("Tarkistetaan edellisyön tulokset...")
-        check_and_update_results()
-        results_text = format_results_report(get_results_summary())
+        check_and_update_results(conn)
+        results_text = format_results_report(get_results_summary(conn))
         cold_streak_text = format_cold_streak_warning(conn)
 
         now_utc = get_now_utc()

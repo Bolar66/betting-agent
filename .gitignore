@@ -223,3 +223,5 @@ data/*.sqlite
 .venv/
 
 src/*sample*.json
+
+src/export/
