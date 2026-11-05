@@ -48,6 +48,8 @@ def init_tables(conn):
             fetched_at TEXT
         )
     """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sgo_odds_event ON sgo_odds(event_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sgo_odds_fetched ON sgo_odds(fetched_at)")
     conn.commit()
     init_state_table(conn)
 

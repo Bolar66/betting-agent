@@ -25,6 +25,10 @@ MAX_LEG_PRICE = 4.0
 MIN_LEG_PROB = 0.25
 
 SLIP_TIERS = {
+    # Lyhyt lappu: 3-5 valintaa eri peleistä. Backtest 29.9.-1.11.2026:
+    # mediaanikerroin 4.4, lappu läpi 7/34 iltana (arvio 7.5).
+    "lyhyt":  {"emoji": "🎯", "min_odds": 3, "max_odds": 10,
+               "min_prob": 0.55, "max_per_game": 1, "max_sel": 5},
     "chilli": {"emoji": "🧊", "min_odds": 100, "max_odds": 1_000,
                "min_prob": 0.55, "max_per_game": 2},
     "perus":  {"emoji": "⚖️", "min_odds": 1_000, "max_odds": 8_000,
@@ -276,7 +280,7 @@ def build_slip(games, cfg):
 
     chosen, total, state = [], 1.0, {}
     for s in pool:
-        if total >= cfg["min_odds"] or len(chosen) >= MAX_SELECTIONS:
+        if total >= cfg["min_odds"] or len(chosen) >= cfg.get("max_sel", MAX_SELECTIONS):
             break
         if total * s["price"] > cfg["max_odds"]:
             continue
